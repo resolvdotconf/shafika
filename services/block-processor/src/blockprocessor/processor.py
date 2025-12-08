@@ -174,48 +174,75 @@ class BlockProcessor:
             tx_count = len(block["transactions"])
             print(f"Processing {tx_count} txs from block {block_number}")
 
+            address_updates = {}  # Collect stats to avoid deadlocks
+            transactions_to_insert = []
+            contracts_to_insert = []
+            new_contract_addresses = set()
+
             for tx in block["transactions"]:
                 tx_data = cast(TxData, tx)
-
-                savepoint = session.begin_nested()
                 try:
-                    self._check_contract_creation(
-                        tx_data, block_number, block_ts, session
+                    # Check for contract creation
+                    new_contract = self._check_contract_creation(
+                        tx_data, block_number, block_ts, address_updates
                     )
+                    if new_contract:
+                        contracts_to_insert.append(new_contract)
+                        new_contract_addresses.add(new_contract.contract_address)
+
                     tx_model = self._parse_transaction(
                         tx_data, block_number, block_hash, block_ts, base_fee
                     )
-                    session.add(tx_model)
+                    transactions_to_insert.append(tx_model)
 
-                    if tx_model.from_address:
-                        self._update_address_stats(
-                            session,
-                            tx_model.from_address,
-                            block_number,
-                            eth_sent=tx_model.value,
-                        )
-
-                    if tx_model.to_address:
-                        # Check if receiver is a contract
-                        is_contract = (
-                            session.query(Contract)
-                            .filter(Contract.contract_address == tx_model.to_address)
-                            .first()
-                            is not None
-                        )
-
-                        self._update_address_stats(
-                            session,
-                            tx_model.to_address,
-                            block_number,
-                            eth_received=tx_model.value,
-                            is_contract=is_contract,
-                        )
-
-                    savepoint.commit()
                 except Exception as e:
-                    savepoint.rollback()
                     print(f"Error parsing tx {tx_data.get('hash', 'unknown')}: {e}")
+
+            unique_to_addresses = {
+                tx.to_address for tx in transactions_to_insert if tx.to_address
+            }
+
+            existing_contracts = set()
+            if unique_to_addresses:
+                results = (
+                    session.query(Contract.contract_address)
+                    .filter(Contract.contract_address.in_(unique_to_addresses))
+                    .all()
+                )
+                existing_contracts = {row[0] for row in results}
+
+            for tx_model in transactions_to_insert:
+                if tx_model.from_address:
+                    self._collect_address_stats(
+                        address_updates,
+                        tx_model.from_address,
+                        block_number,
+                        eth_sent=tx_model.value,
+                    )
+
+                if tx_model.to_address:
+                    # Check if receiver is a contract (newly created OR existing in DB)
+                    is_contract = (
+                        tx_model.to_address in new_contract_addresses
+                        or tx_model.to_address in existing_contracts
+                    )
+
+                    self._collect_address_stats(
+                        address_updates,
+                        tx_model.to_address,
+                        block_number,
+                        eth_received=tx_model.value,
+                        is_contract=is_contract,
+                    )
+
+            # Flush everything in one go
+            if contracts_to_insert:
+                session.bulk_save_objects(contracts_to_insert)
+
+            if transactions_to_insert:
+                session.bulk_save_objects(transactions_to_insert)
+
+            self._flush_address_stats(session, address_updates)
 
             if block_record:
                 block_record.worker_status = WorkerStatus.DONE
@@ -276,9 +303,13 @@ class BlockProcessor:
         )
 
     def _check_contract_creation(
-        self, tx: TxData, block_number, block_ts, session: Session
+        self,
+        tx: TxData,
+        block_number,
+        block_ts,
+        address_updates: dict,
     ):
-        """Check if transaction is a contract creation and store it."""
+        """Check if transaction is a contract creation and return the model."""
         # Contract creation: transaction with no 'to' address
         if tx.get("to") is None:
             tx_hash = tx["hash"]
@@ -301,21 +332,25 @@ class BlockProcessor:
                         deployment_timestamp=block_ts,
                         bytecode_hash=bytecode_hash,
                     )
-                    session.add(contract)
                     print(f"  Contract deployed: {contract_address}")
 
                     # Update deployer's contract deployment count
                     deployer = tx.get("from")
                     if deployer:
-                        self._update_address_stats(
-                            session, deployer, block_number, contract_deployment=True
+                        self._collect_address_stats(
+                            address_updates,
+                            deployer,
+                            block_number,
+                            contract_deployment=True,
                         )
+                    return contract
             except Exception as e:
                 print(f"Error processing contract creation {tx_hash}: {e}")
+        return None
 
-    def _update_address_stats(
+    def _collect_address_stats(
         self,
-        session: Session,
+        updates: dict,
         address: str,
         block_number: int,
         eth_received: int = 0,
@@ -323,36 +358,70 @@ class BlockProcessor:
         is_contract: bool = False,
         contract_deployment: bool = False,
     ):
-        """Update or create address stats using upsert to avoid deadlocks"""
+        """Collect stats in memory instead of writing to DB directly"""
         address_lower = address.lower()
 
-        # Use PostgreSQL's INSERT ... ON CONFLICT DO UPDATE (upsert)
-        stmt = insert(AddressStats).values(
-            address=address_lower,
-            first_seen_block=block_number,
-            last_seen_block=block_number,
-            tx_count=1,
-            eth_received=eth_received,
-            eth_sent=eth_sent,
-            contract_deployments=1 if contract_deployment else 0,
-            is_contract=is_contract,
-        )
+        if address_lower not in updates:
+            updates[address_lower] = {
+                "first_seen_block": block_number,
+                "last_seen_block": block_number,
+                "tx_count": 0,
+                "eth_received": 0,
+                "eth_sent": 0,
+                "contract_deployments": 0,
+                "is_contract": is_contract,
+            }
 
-        # On conflict, update the existing record
+        stats = updates[address_lower]
+        stats["last_seen_block"] = max(stats["last_seen_block"], block_number)
+        stats["first_seen_block"] = min(stats["first_seen_block"], block_number)
+        stats["tx_count"] += 1
+        stats["eth_received"] += eth_received
+        stats["eth_sent"] += eth_sent
+        if contract_deployment:
+            stats["contract_deployments"] += 1
+        if is_contract:
+            stats["is_contract"] = True
+
+    def _flush_address_stats(self, session: Session, updates: dict):
+        """Write collected stats to DB in a SINGLE Bulk Upsert to prevent deadlocks"""
+        if not updates:
+            return
+
+        # Prepare list of dicts for bulk insert
+        # Sort for deterministic locking
+        values_list = []
+        for address in sorted(updates.keys()):
+            stats = updates[address]
+            values_list.append(
+                {
+                    "address": address,
+                    "first_seen_block": stats["first_seen_block"],
+                    "last_seen_block": stats["last_seen_block"],
+                    "tx_count": stats["tx_count"],
+                    "eth_received": stats["eth_received"],
+                    "eth_sent": stats["eth_sent"],
+                    "contract_deployments": stats["contract_deployments"],
+                    "token_transfers_sent": 0,
+                    "token_transfers_received": 0,
+                    "is_contract": stats["is_contract"],
+                }
+            )
+
+        stmt = insert(AddressStats).values(values_list)
+
         stmt = stmt.on_conflict_do_update(
             index_elements=["address"],
             set_={
-                "last_seen_block": block_number,
-                "tx_count": AddressStats.tx_count + 1,
-                "eth_received": AddressStats.eth_received + eth_received,
-                "eth_sent": AddressStats.eth_sent + eth_sent,
-                "contract_deployments": AddressStats.contract_deployments
-                + (1 if contract_deployment else 0),
-                "is_contract": (
-                    stmt.excluded.is_contract
-                    if is_contract
-                    else AddressStats.is_contract
+                "last_seen_block": func.greatest(
+                    AddressStats.last_seen_block, stmt.excluded.last_seen_block
                 ),
+                "tx_count": AddressStats.tx_count + stmt.excluded.tx_count,
+                "eth_received": AddressStats.eth_received + stmt.excluded.eth_received,
+                "eth_sent": AddressStats.eth_sent + stmt.excluded.eth_sent,
+                "contract_deployments": AddressStats.contract_deployments
+                + stmt.excluded.contract_deployments,
+                "is_contract": AddressStats.is_contract | stmt.excluded.is_contract,
                 "updated_at": func.now(),
             },
         )

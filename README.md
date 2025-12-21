@@ -2,6 +2,12 @@
 
 An open-source Ethereum indexer that crawls and ingests blockchain data for you to own.
 
+## AWS Deployment Architecture
+
+Shafika is designed to scale on AWS using ECS Fargate, with auto-scaling based on Redis queue depth. The architecture uses VPC isolation, NAT Gateways for secure outbound connections to Ethereum RPC providers, and separate subnets for compute and data layers. This diagram is built with AWS components, however, similar can be built across GCP or Azure.
+
+![AWS Architecture Diagram](arch.jpg)
+
 ## What Gets Indexed
 
 Right now, Shafika indexes the essentials from Ethereum mainnet:
